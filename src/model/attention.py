@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from src.model.model_args import DeepSeekV3ModelArgs
+from src.model.rope import apply_rotary_emb
 
 
 class ScaledDotProductAttentionWrapper(nn.Module):
@@ -181,3 +182,82 @@ class Attention(nn.Module):
         )
         self.wo_absorbed.weight.copy_(w_o_absorbed)
         self.wo_absorbed.requires_grad_(False)
+
+    def forward_absorbed(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self.wq_absorbed is not None
+        assert self.wo_absorbed is not None
+
+        batch_size, seq_len, _ = x.shape
+
+        q = self.wq_absorbed(x)
+        q = q.view(
+            batch_size,
+            seq_len,
+            self.n_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+
+        # q_nope: [batch_size, seq_len, n_heads, kv_lora_rank]
+        # q_rope: [batch_size, seq_len, n_heads, qk_rope_head_dim]
+        q_nope, q_rope = torch.split(
+            q,
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+        q_rope = apply_rotary_emb(q_rope, freqs_cis)
+
+        # [batch_size, seq_len, n_heads, kv_lora_rank + qk_rope_head_dim] -> [batch_size, n_heads, seq_len, kv_lora_rank + qk_rope_head_dim]
+        q = torch.cat([q_nope, q_rope], dim=-1).transpose(1, 2)
+
+        # latent_raw: [batch_size, seq_len, kv_lora_rank]
+        # k_rope: [batch_size, seq_len, qk_rope_head_dim]
+        latent_raw, k_rope = torch.split(
+            self.wkv_a(
+                x
+            ),  # [batch_size, seq_len, dim] -> [batch_size, seq_len, kv_lora_rank + qk_rope_head_dim]
+            [self.kv_lora_rank, self.qk_rope_head_dim],
+            dim=-1,
+        )
+
+        # This is the latent that should be cached.
+        # latent: [batch_size, seq_len, kv_lora_rank]
+        latent = self.kv_norm(latent_raw)
+
+        # [batch_size, seq_len, 1, qk_rope_head_dim]
+        k_rope = apply_rotary_emb(k_rope.unsqueeze(2), freqs_cis)
+
+        # A single shared storage tensor:
+        # shared_cache: [batch_size, seq_len, 1, kv_lora_rank + qk_rope_head_dim] -> [batch_size, 1, seq_len, kv_lora_rank + qk_rope_head_dim]
+        shared_cache = torch.cat(
+            [latent.unsqueeze(2), k_rope],
+            dim=-1,
+        ).transpose(1, 2)
+
+        # k: [batch_size, 1, seq_len, kv_lora_rank + qk_rope_head_dim]
+        k = shared_cache
+
+        # v: [batch_size, 1, seq_len, kv_lora_rank]
+        v = shared_cache[..., : self.kv_lora_rank]
+
+        # latent_output: [batch_size, n_heads, seq_len, kv_lora_rank]
+        latent_output = self.inner_attention(q, k, v, scale=self.softmax_scale)
+
+        # [batch_size, seq_len, n_heads * kv_lora_rank]
+        latent_output = (
+            latent_output.transpose(
+                1, 2
+            )  # [batch_size, n_heads, seq_len, kv_lora_rank] -> [batch_size, seq_len, n_heads, kv_lora_rank]
+            .contiguous()
+            .view(
+                batch_size,
+                seq_len,
+                self.n_heads * self.kv_lora_rank,
+            )
+        )
+
+        # output: [batch_size, seq_len, dim]
+        return self.wo_absorbed(latent_output)
