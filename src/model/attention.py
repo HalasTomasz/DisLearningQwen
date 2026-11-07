@@ -101,7 +101,7 @@ class Attention(nn.Module):
             bias=False,
         )
         self.wo = nn.Linear(self.n_heads * self.v_head_dim, self.dim, bias=False)
-        self.softmax_scale = self.qk_rope_head_dim**-0.5  # Paper
+        self.softmax_scale = self.qk_head_dim**-0.5
 
         # yarn
         if model_args.max_seq_len > model_args.original_seq_len:

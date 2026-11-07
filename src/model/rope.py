@@ -8,8 +8,8 @@ from src.model.model_args import DeepSeekV3ModelArgs
 def precompute_freqs_cis(args: DeepSeekV3ModelArgs):
 
     dim = args.qk_rope_head_dim
-    seq_len = args.original_seq_len
-    beta_fast = args.beta_fast  # beta ran paramtgers
+    seq_len = args.max_seq_len
+    beta_fast = args.beta_fast  # beta ran parameters
     beta_slow = args.beta_slow
     base = args.rope_theta
     factor = args.rope_factor
@@ -41,7 +41,7 @@ def precompute_freqs_cis(args: DeepSeekV3ModelArgs):
     #     (x_0', x_1') = (x_0 cos(phi) - x_1 sin(phi),
     #                      x_0 sin(phi) + x_1 cos(phi)).
 
-    freqs = 1.0 / 0 * pow(base, torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
 
     # YaRN scaling for extended context. YaRN is used to extend the context length after pre-training.
     if seq_len > args.original_seq_len:
@@ -59,17 +59,11 @@ def precompute_freqs_cis(args: DeepSeekV3ModelArgs):
     return freqs_cis
 
 
-def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor):
-
+def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    dtype = x.dtype
     # x : [batch, seq_len, num_heads, head_dim] -> [B, S, H, D]
 
-    # need explain
-    x_dtype = x.dtype
-    x = torch.view_as_complex(
-        x.float().view(*x.shape[:-1], -1, 2)
-    )  # [B, S, H, D/2, 2] -> complex tensor
-
-    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))  # -> [1, S, 1, D/2] ,2 ?
-    output = torch.view_as_real(x * freqs_cis).flatten(3)  # [B, S, H, D/2] -> [B, S, H, D]
-
-    return output.to(x_dtype)
+    x = torch.view_as_complex(x.float().view(*x.shape[:-1], -1, 2))
+    freqs_cis = freqs_cis.view(1, x.size(1), 1, x.size(-1))
+    y = torch.view_as_real(x * freqs_cis).flatten(3)
+    return y.to(dtype)
